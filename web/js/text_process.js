@@ -1,0 +1,146 @@
+import { app } from "../../../scripts/app.js";
+
+/**
+ * 文本处理节点前端：
+ * - 「输入端口」控件控制左侧 any_X 动态输入端口数量。
+ * - 「输出段落」控件控制右侧 段落X 动态输出端口数量。
+ * - 「更新端口」按钮应用更改；加载工作流时按控件数值自动恢复端口。
+ */
+app.registerExtension({
+    name: "yanhuo.easy.use.TextProcess",
+    async beforeRegisterNodeDef(nodeType, nodeData, app) {
+        if (nodeData.name !== "YanhuoTextProcess") return;
+
+        nodeType.prototype.updateInputPorts = function (doResize = false) {
+            if (!this.widgets) return;
+
+            const inputCountWidget = this.widgets.find(w => w.name === "输入端口");
+            if (!inputCountWidget) return;
+
+            const updateFn = () => {
+                const targetCount = Math.max(1, inputCountWidget.value);
+                this.inputs = this.inputs || [];
+
+                // 获取所有动态输入 (any_X)
+                let dynamicInputs = this.inputs.filter(i => i.name.startsWith("any_"));
+                let currentCount = dynamicInputs.length;
+
+                // 保险：把已有 any_X 端口统一标记为 optional（避免历史节点/自动生成端口实心圆点）
+                for (const inp of dynamicInputs) {
+                    if (!inp.extra) inp.extra = {};
+                    inp.extra.optional = true;
+                }
+
+                if (targetCount > currentCount) {
+                    // 增加端口（optional:true 与后端 INPUT_TYPES.optional 对齐，显示为空心圆点）
+                    for (let i = currentCount + 1; i <= targetCount; i++) {
+                        this.addInput("any_" + i, "*", { optional: true });
+                    }
+                } else if (targetCount < currentCount) {
+                    // 减少端口 (从后往前删)
+                    for (let i = this.inputs.length - 1; i >= 0; i--) {
+                        const inputName = this.inputs[i].name;
+                        if (inputName.startsWith("any_")) {
+                            const idx = parseInt(inputName.split("_")[1]);
+                            if (idx > targetCount) {
+                                this.removeInput(i);
+                            }
+                        }
+                    }
+                }
+            };
+
+            if (doResize) {
+                this.resizeNode(updateFn);
+                if (this.setDirtyCanvas) {
+                    this.setDirtyCanvas(true, true);
+                }
+            } else {
+                updateFn();
+            }
+        };
+
+        nodeType.prototype.updateOutputPorts = function (doResize = false) {
+            if (!this.widgets) return;
+
+            const outputCountWidget = this.widgets.find(w => w.name === "输出段落");
+            if (!outputCountWidget) return;
+
+            const updateFn = () => {
+                const targetCount = Math.max(0, outputCountWidget.value);
+                this.outputs = this.outputs || [];
+
+                // 确保基础输出始终存在
+                if (this.outputs.length < 1) this.addOutput("数:", "INT");
+                if (this.outputs.length < 2) this.addOutput("总段:", "STRING");
+
+                // 获取所有动态输出 (段落X)
+                let dynamicOutputs = this.outputs.filter(o => o.name.startsWith("段落"));
+                let currentCount = dynamicOutputs.length;
+
+                if (targetCount > currentCount) {
+                    // 增加端口
+                    for (let i = currentCount + 1; i <= targetCount; i++) {
+                        this.addOutput("段落" + i, "STRING");
+                    }
+                } else if (targetCount < currentCount) {
+                    // 减少端口 (从后往前删)
+                    for (let i = this.outputs.length - 1; i >= 0; i--) {
+                        const outputName = this.outputs[i].name;
+                        if (outputName.startsWith("段落")) {
+                            const idx = parseInt(outputName.replace("段落", ""));
+                            if (idx > targetCount) {
+                                this.removeOutput(i);
+                            }
+                        }
+                    }
+                }
+            };
+
+            if (doResize) {
+                this.resizeNode(updateFn);
+                if (this.setDirtyCanvas) {
+                    this.setDirtyCanvas(true, true);
+                }
+            } else {
+                updateFn();
+            }
+        };
+
+        nodeType.prototype.resizeNode = function (updateFn) {
+            const oldSize = this.computeSize()[1];
+            updateFn();
+            const newSize = this.computeSize()[1];
+            if (this.size) {
+                this.setSize([this.size[0], this.size[1] + (newSize - oldSize)]);
+            }
+        };
+
+        const onNodeCreated = nodeType.prototype.onNodeCreated;
+        nodeType.prototype.onNodeCreated = function () {
+            onNodeCreated?.apply(this, arguments);
+
+            // 1. 添加「更新端口」按钮
+            this.addWidget("button", "更新端口", null, () => {
+                this.updateInputPorts(true);
+                this.updateOutputPorts(true);
+            });
+
+            // 2. 初始尺寸与端口状态
+            this.setSize([400, 300]);
+            this.updateInputPorts(false);
+            this.updateOutputPorts(false);
+        };
+
+        // 加载工作流后按保存的控件数值恢复动态端口
+        const onConfigure = nodeType.prototype.onConfigure;
+        nodeType.prototype.onConfigure = function () {
+            onConfigure?.apply(this, arguments);
+            const node = this;
+            setTimeout(() => {
+                node.updateInputPorts?.(false);
+                node.updateOutputPorts?.(false);
+            }, 0);
+        };
+    },
+});

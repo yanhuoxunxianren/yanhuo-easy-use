@@ -1,0 +1,13 @@
+[project]
+name = "yanhuo-easy-use"
+description = "烟火的 ComfyUI 实用节点集：文本处理 / 批量替换、音频拼接、图像批次、整数控制、组忽略管理等 11 个节点，中文界面，含前端扩展。"
+version = "1.0.0"
+license = { file = "LICENSE" }
+dependencies = []
+
+[tool.comfy]
+# ComfyUI Registry 收录用。发布到 https://registry.comfy.org 前，
+# 把 PublisherId 换成你在 ComfyUI Registry 后台创建的 Publisher ID。
+PublisherId = "yanhuo"
+DisplayName = "yanhuo-easy-use"
+Icon = ""
