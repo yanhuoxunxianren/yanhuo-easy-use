@@ -842,7 +842,8 @@ let closeActiveCombo = null;
  * @returns {{ el: HTMLElement, close: Function, getValue: Function }}
  */
 function makeSearchCombo(names, value, onPick) {
-    const sorted = sortNames(names);
+    // names 可以是数组，也可以是函数（每次展开下拉时重新计算候选，调用方可用它做动态过滤）
+    const getNames = typeof names === "function" ? names : () => names;
 
     const wrap = el("div", "ygim-combo");
     const btn = el("button", "ygim-combo-btn");
@@ -878,6 +879,7 @@ function makeSearchCombo(names, value, onPick) {
         if (closeActiveCombo) closeActiveCombo();
         closeActiveCombo = close;
 
+        const sorted = sortNames(getNames());
         pop = el("div", "ygim-combo-pop");
         const input = el("input", "ygim-input");
         input.type = "text";
@@ -1112,6 +1114,23 @@ function openLinkageDialog(node, groupName) {
         const box = el("div");
         modal.body.appendChild(box);
 
+        // 本分类下已被其它规则占用的目标组（不含 excludeIdx 自己）；
+        // 「组开启时」和「组关闭时」各自独立计算，互不影响
+        const usedTargets = (key, excludeIdx) => {
+            const used = new Set();
+            (draft[key] || []).forEach((r, i) => {
+                if (i !== excludeIdx && r && r.target) used.add(r.target);
+            });
+            return used;
+        };
+        // 候选 = 全部组 - 本分类内其它规则已选的组；自己已选的那项保留（否则当前值会被过滤掉）
+        const candidatesFor = (key, excludeIdx) => {
+            const used = usedTargets(key, excludeIdx);
+            return allNames.filter((n) => !used.has(n));
+        };
+        // 新增规则时默认选中第一个未被占用的组
+        const firstFreeTarget = (key) => candidatesFor(key, -1)[0] || "";
+
         const paint = () => {
             box.innerHTML = "";
             const rules = draft[key];
@@ -1122,10 +1141,15 @@ function openLinkageDialog(node, groupName) {
             rules.forEach((rule, i) => {
                 const line = el("div", "ygim-rule");
 
-                // 可搜索下拉：顶部搜索框，选项按字母序
-                const targetCombo = makeSearchCombo(allNames, rule.target || "", (n) => {
-                    rule.target = n;
-                });
+                // 可搜索下拉：顶部搜索框，选项按字母序；
+                // 候选在每次展开时动态计算，排除本分类内其它规则已选的组
+                const targetCombo = makeSearchCombo(
+                    () => candidatesFor(key, i),
+                    rule.target || "",
+                    (n) => {
+                        rule.target = n;
+                    }
+                );
 
                 const actSel = el("select", "ygim-sel ygim-act");
                 for (const [v, t] of [
@@ -1156,7 +1180,7 @@ function openLinkageDialog(node, groupName) {
         };
 
         add.addEventListener("click", () => {
-            draft[key].push({ target: allNames[0] || "", action: "disable" });
+            draft[key].push({ target: firstFreeTarget(key), action: "disable" });
             paint();
         });
 
