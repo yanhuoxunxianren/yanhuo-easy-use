@@ -11,6 +11,11 @@ from PIL import Image, ImageOps
 import folder_paths
 import comfy.utils
 
+try:
+    import av
+except ImportError:
+    av = None
+
 INT_MIN = -9223372036854775807
 INT_MAX = 9223372036854775807
 
@@ -293,6 +298,9 @@ class YanhuoImageBatchMulti:
         return out
 
     def batch(self, 输入数量=3, 尺寸处理="缩放到第一张", 跳过黑色占位图=True, **kwargs):
+        # INPUT_IS_LIST 模式下 widget 值也会被包成单元素列表，先取回标量
+        尺寸处理 = _unwrap_list_input(尺寸处理)
+        跳过黑色占位图 = _unwrap_list_input(跳过黑色占位图)
         # 1) 收集所有 image_N 端口（按序号排序）；输入数量仅控制前端端口数量，
         #    后端以实际接入的有效输入为准，避免 UI 与实际连接不同步时丢数据。
         #    端口声明了 INPUT_IS_LIST：上游图像列表（list of tensor）按顺序展开。
@@ -1184,6 +1192,496 @@ class YanhuoMultiImage:
         return os.path.join(folder_paths.get_input_directory(), path)
 
 
+def _default_audio_track_name(index):
+    """生成默认音频轨道名：0→音频A, 1→音频B, 25→音频Z, 26→音频AA..."""
+    name = ""
+    n = index
+    do = True
+    while do or n >= 0:
+        name = chr(65 + (n % 26)) + name
+        n = n // 26 - 1
+        do = False
+    return "音频" + name
+
+
+def _to_float_pcm(wav: torch.Tensor) -> torch.Tensor:
+    """把 int16/int32 PCM 转成 float32。"""
+    if wav.dtype.is_floating_point:
+        return wav
+    if wav.dtype == torch.int16:
+        return wav.float() / (2 ** 15)
+    if wav.dtype == torch.int32:
+        return wav.float() / (2 ** 31)
+    raise ValueError(f"不支持的音频数据类型: {wav.dtype}")
+
+
+class YanhuoMultiAudio:
+    """
+    加载批量音频节点（多轨道版）：一个节点里加载多段互不相同的音频。
+    - 最多 20 条音轨，每条音轨可容纳多段音频（像加载批量图像的画廊一样），
+      音轨输出为音频批次（AUDIO 列表，列表内每段音频独立，保持各自采样率）。
+    - 音轨可重命名，右侧输出端口名跟随音轨名变化。
+    - 前端支持点击选择、拖入、粘贴多个音频文件。
+    - 空音轨输出 1 秒静音兜底，不报错、不中断执行。
+    """
+
+    MAX_TRACKS = 20
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "tracks_data": ("STRING", {
+                    "default": "",
+                    "multiline": True,
+                    "display_name": "音轨数据",
+                    "tooltip": "JSON 格式音轨数据，由前端自动维护。格式：[{\"name\":\"音频A\",\"paths\":[\"a.mp3\",\"b.wav\"]}]",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("AUDIO",) * MAX_TRACKS
+    RETURN_NAMES = tuple(_default_audio_track_name(i) for i in range(MAX_TRACKS))
+    OUTPUT_IS_LIST = (True,) * MAX_TRACKS
+    OUTPUT_TOOLTIPS = tuple(f"音轨 {i + 1} 的音频批次（列表，每段音频独立）。" for i in range(MAX_TRACKS))
+    FUNCTION = "load_audios"
+    CATEGORY = "yanhuo"
+    DESCRIPTION = (
+        "加载批量音频：一个节点内加载多段不同音频，每条音轨可容纳多段音频，"
+        "输出为音频批次（列表）。支持点击选择 / 拖入 / 粘贴多个音频文件，端口名跟随音轨名。"
+    )
+
+    @staticmethod
+    def _resolve_audio_path(path):
+        """解析音频路径，支持 output:/input:/temp: 前缀及绝对/相对路径。"""
+        if not path:
+            return path
+        path = path.strip()
+        if path.startswith("output:"):
+            return os.path.join(folder_paths.get_output_directory(), path[len("output:"):])
+        if path.startswith("input:"):
+            return os.path.join(folder_paths.get_input_directory(), path[len("input:"):])
+        if path.startswith("temp:"):
+            return os.path.join(folder_paths.get_temp_directory(), path[len("temp:"):])
+        if os.path.isabs(path) and os.path.exists(path):
+            return path
+        return os.path.join(folder_paths.get_input_directory(), path)
+
+    @staticmethod
+    def empty_audio(duration=1.0, sample_rate=44100, channels=1):
+        """静音兜底音频。"""
+        n = max(1, int(round(duration * sample_rate)))
+        return {"waveform": torch.zeros((1, channels, n), dtype=torch.float32), "sample_rate": sample_rate}
+
+    @classmethod
+    def load_audio_file(cls, path):
+        """用 pyav 加载单个音频文件，返回 {"waveform": [1,C,T], "sample_rate": sr}。"""
+        if av is None:
+            raise RuntimeError("未安装 av（pyav），无法加载音频文件。")
+        full_path = cls._resolve_audio_path(path)
+        if not os.path.exists(full_path):
+            raise FileNotFoundError(f"音频文件不存在: {full_path}")
+
+        with av.open(full_path) as af:
+            if not af.streams.audio:
+                raise ValueError("文件中没有音频流。")
+            stream = af.streams.audio[0]
+            sample_rate = stream.codec_context.sample_rate
+            n_channels = stream.channels
+
+            frames = []
+            for frame in af.decode(streams=stream.index):
+                buf = torch.from_numpy(frame.to_ndarray())
+                if buf.shape[0] != n_channels:
+                    buf = buf.view(-1, n_channels).t()
+                frames.append(buf)
+
+            if not frames:
+                raise ValueError("未解码出任何音频帧。")
+
+            wav = torch.cat(frames, dim=1)
+            wav = _to_float_pcm(wav)
+
+        return {"waveform": wav.unsqueeze(0), "sample_rate": sample_rate}
+
+    def load_audios(self, tracks_data):
+        try:
+            tracks = json.loads(tracks_data) if tracks_data and tracks_data.strip() else []
+        except (json.JSONDecodeError, TypeError):
+            tracks = []
+
+        results = []
+        for i in range(self.MAX_TRACKS):
+            paths = []
+            name = _default_audio_track_name(i)
+            if i < len(tracks) and isinstance(tracks[i], dict):
+                track = tracks[i]
+                name = track.get("name", "") or name
+                raw = track.get("paths", None)
+                if raw is None:
+                    # 兼容旧版单文件格式 {"path": "..."}
+                    raw = track.get("path", "")
+                if isinstance(raw, str):
+                    paths = [p.strip() for p in raw.split("\n") if p.strip()]
+                elif isinstance(raw, (list, tuple)):
+                    paths = [p.strip() for p in raw if isinstance(p, str) and p.strip()]
+
+            if not paths:
+                # 空音轨：1 秒静音兜底（保持链路，下游可用「跳过静音占位」过滤）
+                results.append([self.empty_audio()])
+                continue
+
+            track_items = []
+            for path in paths:
+                try:
+                    track_items.append(self.load_audio_file(path))
+                except Exception as e:
+                    print(f"[yanhuo] 加载批量音频：音轨「{name}」的 {path} 加载失败（{e}），已跳过。")
+            if not track_items:
+                results.append([self.empty_audio()])
+            else:
+                results.append(track_items)
+
+        return tuple(results)
+
+
+class YanhuoAudioBatchMulti:
+    """
+    音频批次合并节点：把多段音频打包为一个「音频批次」（AUDIO 列表）输出，
+    与「图像批次合并」同理 —— 不是拼接成一段音频，而是多段音频各自独立成为一个批次。
+    - 通过「输入数量」+「更新输入」按钮管理 audio_1..audio_N 输入端口（最多 50）。
+    - 自动跳过空输入：未连接（None）、波形为空（0 采样）、以及纯静音占位音频。
+    - 输入的 AUDIO 若本身是批次（waveform batch > 1），会按 batch 顺序逐条拆出。
+    - 各段音频保持自己的采样率与声道数，不做重采样/拼接；采样率不一致时仅打印提示。
+    - 输入端口也接受音频列表（INPUT_IS_LIST），上游列表会按顺序展开后再打包。
+    """
+
+    MAX_INPUTS = 50
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        optional_inputs = {f"audio_{i}": ("AUDIO",) for i in range(1, cls.MAX_INPUTS + 1)}
+        return {
+            "required": {
+                "输入数量": ("INT", {"default": 3, "min": 2, "max": cls.MAX_INPUTS, "step": 1}),
+                "跳过静音占位": ("BOOLEAN", {
+                    "default": True,
+                    "label_on": "跳过",
+                    "label_off": "保留",
+                    "tooltip": "上游节点无结果时常输出纯静音占位音频，开启时视为空输入跳过，不参与打包。",
+                }),
+            },
+            "optional": optional_inputs,
+            "INPUT_IS_LIST": {f"audio_{i}": True for i in range(1, cls.MAX_INPUTS + 1)},
+        }
+
+    RETURN_TYPES = ("AUDIO",)
+    RETURN_NAMES = ("audios",)
+    OUTPUT_IS_LIST = (True,)
+    FUNCTION = "batch"
+    CATEGORY = "yanhuo"
+    DESCRIPTION = (
+        "音频批次合并：把多段音频打包为一个音频批次（列表）输出，各段音频互不拼接、独立保留。"
+        "自动跳过空输入与静音占位；所有输入为空时输出 1 秒静音兜底，不报错。"
+    )
+
+    @staticmethod
+    def _is_silent(item):
+        """判断是否为纯静音占位音频。"""
+        try:
+            wav = item["waveform"]
+            return bool(torch.all(torch.abs(wav) <= 1e-6))
+        except Exception:
+            return False
+
+    def batch(self, 输入数量=3, 跳过静音占位=True, **kwargs):
+        # INPUT_IS_LIST 模式下 widget 值也会被包成单元素列表，先取回标量
+        跳过静音占位 = _unwrap_list_input(跳过静音占位)
+        items = []
+        for key, val in kwargs.items():
+            m = re.fullmatch(r"audio_(\d+)", str(key))
+            if m and val is not None:
+                items.append((int(m.group(1)), val))
+        items.sort(key=lambda x: x[0])
+
+        audios = []
+        for port_no, val in items:
+            sub = val if isinstance(val, (list, tuple)) else [val]
+            if len(sub) == 0:
+                print(f"[yanhuo] 音频批次合并：audio_{port_no} 输入为空，已跳过，继续打包后续输入。")
+                continue
+            for v in sub:
+                if v is None:
+                    continue
+                if not isinstance(v, dict) or "waveform" not in v or "sample_rate" not in v:
+                    print(f"[yanhuo] 音频批次合并：audio_{port_no} 含无效音频数据，已跳过。")
+                    continue
+                wav = v["waveform"]
+                sr = v["sample_rate"]
+                if not isinstance(wav, torch.Tensor) or wav.ndim < 2 or wav.shape[0] == 0:
+                    print(f"[yanhuo] 音频批次合并：audio_{port_no} 含空波形，已跳过。")
+                    continue
+                if wav.shape[-1] == 0:
+                    print(f"[yanhuo] 音频批次合并：audio_{port_no} 含 0 采样音频，已跳过。")
+                    continue
+                # 把 multi-batch 波形逐条拆开，保证批次里每一项都是 [1,C,T]
+                if wav.ndim == 2:
+                    wav = wav.unsqueeze(0)
+                for i in range(wav.shape[0]):
+                    item = {"waveform": wav[i:i + 1], "sample_rate": sr}
+                    if 跳过静音占位 and self._is_silent(item):
+                        print(f"[yanhuo] 音频批次合并：audio_{port_no} 第{i + 1}段为纯静音占位，已跳过。")
+                        continue
+                    audios.append(item)
+
+        if len(audios) == 0:
+            print("[yanhuo] 音频批次合并：所有输入均为空，输出 1 段静音兜底。")
+            return ([{"waveform": torch.zeros((1, 1, 44100), dtype=torch.float32), "sample_rate": 44100}],)
+
+        # 采样率 / 声道不一致仅提示，不做重采样（批次中每段音频各自独立）
+        rates = sorted({item["sample_rate"] for item in audios})
+        if len(rates) > 1:
+            print(f"[yanhuo] 音频批次合并：批次内采样率不一致 {rates}，各段保持原样不做重采样。")
+        chans = sorted({item["waveform"].shape[1] for item in audios})
+        if len(chans) > 1:
+            print(f"[yanhuo] 音频批次合并：批次内声道数不一致 {chans}，各段保持原样。")
+
+        return (audios,)
+
+
+_OPUS_RATES = [8000, 12000, 16000, 24000, 48000]
+
+
+def _unwrap_list_input(v):
+    """ComfyUI 声明 INPUT_IS_LIST 后会把所有输入（包括 widget 下拉框/开关值）包成单元素列表，取回标量。"""
+    if isinstance(v, (list, tuple)):
+        return v[0] if len(v) > 0 else None
+    return v
+
+
+def _encode_audio_to_bytes(wav, sample_rate, fmt="flac", quality="192k"):
+    """把 [C,T] float 波形编码为 flac/mp3/opus 字节流（编码方式与官方 SaveAudio 一致）。"""
+    import io as _io
+    if av is None:
+        raise RuntimeError("未安装 av（pyav），无法编码音频。")
+
+    sample_rate = int(sample_rate)
+
+    # opus 只支持特定采样率
+    if fmt == "opus":
+        if sample_rate > 48000:
+            sample_rate = 48000
+        elif sample_rate not in _OPUS_RATES:
+            for rate in sorted(_OPUS_RATES):
+                if rate > sample_rate:
+                    sample_rate = rate
+                    break
+            if sample_rate not in _OPUS_RATES:
+                sample_rate = 48000
+
+    layout = "mono" if wav.shape[0] == 1 else "stereo"
+    output_buffer = _io.BytesIO()
+    output_container = av.open(output_buffer, mode="w", format=fmt)
+
+    if fmt == "opus":
+        out_stream = output_container.add_stream("libopus", rate=sample_rate, layout=layout)
+        if quality.endswith("k") and quality[:-1].isdigit():
+            out_stream.bit_rate = int(quality[:-1]) * 1000
+    elif fmt == "mp3":
+        out_stream = output_container.add_stream("libmp3lame", rate=sample_rate, layout=layout)
+        if quality == "V0":
+            out_stream.codec_context.qscale = 1
+        elif quality.endswith("k") and quality[:-1].isdigit():
+            out_stream.bit_rate = int(quality[:-1]) * 1000
+    else:  # flac
+        out_stream = output_container.add_stream("flac", rate=sample_rate, layout=layout)
+
+    frame = av.AudioFrame.from_ndarray(
+        wav.movedim(0, 1).reshape(1, -1).float().numpy(),
+        format="flt",
+        layout=layout,
+    )
+    frame.sample_rate = sample_rate
+    frame.pts = 0
+    output_container.mux(out_stream.encode(frame))
+    output_container.mux(out_stream.encode(None))
+    output_container.close()
+
+    output_buffer.seek(0)
+    return output_buffer.getbuffer()
+
+
+class YanhuoAudioBatchSave:
+    """
+    音频批次预览/保存节点：「音频批次合并」「加载批量音频」输出的接收端。
+    - 接收音频批次（AUDIO 列表，可含多段不同音频），逐段预览和/或保存。
+    - 预览：写入临时目录，在节点上直接逐段试听。
+    - 保存：写入 output 目录（格式 flac/mp3/opus），文件名自动编号。
+    - 音频原样透传，可继续串接下游节点。
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "audios": ("AUDIO", {"tooltip": "音频批次（列表），可包含多段不同的音频。"}),
+                "输出模式": (["预览", "保存", "预览并保存"], {"default": "预览"}),
+                "保存格式": (["flac", "mp3", "opus"], {"default": "flac"}),
+                "音质": (["V0", "64k", "96k", "128k", "192k", "320k"], {"default": "192k"}),
+                "文件名前缀": ("STRING", {"default": "audio/yanhuo"}),
+            },
+        }
+
+    RETURN_TYPES = ("AUDIO",)
+    RETURN_NAMES = ("audios",)
+    OUTPUT_IS_LIST = (True,)
+    INPUT_IS_LIST = {"audios": True}
+    FUNCTION = "save_preview"
+    CATEGORY = "yanhuo"
+    OUTPUT_NODE = True
+    DESCRIPTION = (
+        "音频批次预览/保存：接收音频批次（多段音频），逐段预览试听和/或保存为 flac/mp3/opus 文件。"
+    )
+
+    def save_preview(self, audios, 输出模式="预览", 保存格式="flac", 音质="192k",
+                     文件名前缀="audio/yanhuo"):
+        # INPUT_IS_LIST 模式下 widget 值也会被包成单元素列表，先取回标量
+        输出模式 = _unwrap_list_input(输出模式)
+        保存格式 = _unwrap_list_input(保存格式)
+        音质 = _unwrap_list_input(音质)
+        文件名前缀 = _unwrap_list_input(文件名前缀)
+        # 输入声明了 INPUT_IS_LIST：audios 一定是列表；兼容单个 dict 传入
+        if isinstance(audios, dict):
+            audios = [audios]
+        audios = [a for a in (audios or []) if isinstance(a, dict) and "waveform" in a]
+
+        ui_entries = []
+        need_file = 输出模式 in ("保存", "预览并保存")
+        need_preview = 输出模式 in ("预览", "预览并保存")
+
+        # mp3 不支持 64k/96k/192k 这类码率时回退到 128k
+        quality = 音质
+        if 保存格式 == "mp3" and quality not in ("V0", "128k", "320k"):
+            quality = "128k"
+        if 保存格式 == "flac":
+            quality = "192k"
+
+        for item in audios:
+            waveform = item["waveform"]
+            sample_rate = item["sample_rate"]
+            if not isinstance(waveform, torch.Tensor) or waveform.ndim < 2 or waveform.shape[-1] == 0:
+                continue
+
+            for batch_number, wav in enumerate(waveform.cpu()):
+                data = _encode_audio_to_bytes(wav, sample_rate, 保存格式, quality)
+
+                if need_file:
+                    full_output_folder, filename, counter, subfolder, _ = folder_paths.get_save_image_path(
+                        文件名前缀, folder_paths.get_output_directory())
+                    base = filename.replace("%batch_num%", str(batch_number))
+                    file = f"{base}_{counter:05}.{保存格式}"
+                    with open(os.path.join(full_output_folder, file), "wb") as f:
+                        f.write(data)
+                    if 输出模式 == "保存":
+                        ui_entries.append({"filename": file, "subfolder": subfolder, "type": "output"})
+                    else:
+                        # 预览并保存：播放器直接读 output 里的文件
+                        ui_entries.append({"filename": file, "subfolder": subfolder, "type": "output"})
+
+                if need_preview:
+                    temp_dir = folder_paths.get_temp_directory()
+                    full_temp_folder, filename, counter, subfolder, _ = folder_paths.get_save_image_path(
+                        文件名前缀, temp_dir)
+                    base = filename.replace("%batch_num%", str(batch_number))
+                    file = f"{base}_{counter:05}.{保存格式}"
+                    with open(os.path.join(full_temp_folder, file), "wb") as f:
+                        f.write(data)
+                    ui_entries.append({"filename": file, "subfolder": subfolder, "type": "temp"})
+
+        if not ui_entries and len(audios) > 0:
+            print("[yanhuo] 音频批次预览/保存：批次中没有有效音频。")
+
+        return {"ui": {"audio": ui_entries}, "result": (audios,)}
+
+
+class YanhuoAudioFilter:
+    """
+    筛选音频：按索引从音频批次（AUDIO 列表）中提取一段或多段，顺序保持。
+    - 索引从 0 起，逗号分隔，支持多行（多行合并为一条序列）；
+      输入 "5, 3, 0, 1" 表示依次提取第六、第四、第一、第二段。
+    - 无效索引（越界 / 非数字）自动忽略；全无效时输出 1 秒静音兜底，不报错。
+    - 输出为音频批次（列表），可直接接「音频批次预览/保存」或「音频批次合并」。
+    """
+
+    RETURN_TYPES = ("AUDIO",)
+    RETURN_NAMES = ("筛选音频",)
+    OUTPUT_IS_LIST = (True,)
+    INPUT_IS_LIST = {"audios": True}
+    FUNCTION = "filter_audios"
+    CATEGORY = "yanhuo"
+    OUTPUT_NODE = False
+    DESCRIPTION = (
+        "从音频批次中筛选一段或多段音频，按索引顺序输出为新的音频批次。"
+        "索引从 0 起，逗号分隔，支持多行；无效索引自动忽略，全无效时回退到第 0 段。"
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "audios": ("AUDIO", {"display_name": "输入音频", "tooltip": "音频批次（列表），可来自音频批次合并或加载批量音频的某条轨道。"}),
+                "indexes": ("STRING", {"default": "0, 1, 2", "multiline": True, "display_name": "索引列表", "tooltip": "逗号分隔的索引（从 0 起），按书写顺序提取对应音频段，如 5,3,0,1；也支持多行。超出范围的索引会被忽略。"}),
+            },
+        }
+
+    @staticmethod
+    def _parse_indexes(indexes, count):
+        """解析索引字符串（支持中英文逗号/分号/空白/多行），返回范围内的有效索引列表（顺序保持）。"""
+        valid = []
+        for token in str(indexes or "").replace("，", ",").replace("、", ",").replace(";", ",").replace("；", ",").replace("\n", ",").replace(" ", ",").split(","):
+            token = token.strip()
+            if not token:
+                continue
+            try:
+                idx = int(token)
+            except ValueError:
+                continue
+            if 0 <= idx < count:
+                valid.append(idx)
+        return valid
+
+    def filter_audios(self, audios, indexes):
+        indexes = _unwrap_list_input(indexes)  # INPUT_IS_LIST 模式下 widget 值也是列表
+
+        # 展开所有输入为独立的音频段（兼容单个 dict / 多 batch 波形）
+        segments = []
+        for a in (audios if isinstance(audios, (list, tuple)) else [audios]):
+            if not isinstance(a, dict) or "waveform" not in a:
+                continue
+            wf, sr = a.get("waveform"), a.get("sample_rate")
+            if not isinstance(wf, torch.Tensor) or wf.ndim < 2 or wf.shape[0] == 0:
+                continue
+            for i in range(wf.shape[0]):
+                segments.append({"waveform": wf[i:i + 1], "sample_rate": sr})
+
+        valid = self._parse_indexes(indexes, len(segments))
+        if valid:
+            chosen = [segments[i] for i in valid]
+        elif segments:
+            chosen = [segments[0]]  # 全无效：回退第 0 段
+        else:
+            chosen = [self._silent()]  # 输入为空：1 秒静音兜底
+            print("[yanhuo] 筛选音频：输入音频批次为空，输出 1 秒静音兜底。")
+        if not valid and segments:
+            print("[yanhuo] 筛选音频：索引全部无效，回退输出第 0 段。")
+
+        return (chosen,)
+
+    @staticmethod
+    def _silent(sr=44100):
+        return {"waveform": torch.zeros((1, 1, sr)), "sample_rate": sr}
+
+
 class YanhuoGroupIgnoreManager:
     """
     组忽略管理器（前端工具节点）
@@ -1224,6 +1722,10 @@ NODE_CLASS_MAPPINGS = {
     "YanhuoTextSortVerify": YanhuoTextSortVerify,
     "YanhuoTextProcess": YanhuoTextProcess,
     "YanhuoMultiImage": YanhuoMultiImage,
+    "YanhuoMultiAudio": YanhuoMultiAudio,
+    "YanhuoAudioBatchMulti": YanhuoAudioBatchMulti,
+    "YanhuoAudioBatchSave": YanhuoAudioBatchSave,
+    "YanhuoAudioFilter": YanhuoAudioFilter,
     "YanhuoGroupIgnoreManager": YanhuoGroupIgnoreManager,
 }
 
@@ -1238,5 +1740,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "YanhuoTextSortVerify": "文本排序验证",
     "YanhuoTextProcess": "文本处理",
     "YanhuoMultiImage": "加载批量图像",
+    "YanhuoMultiAudio": "加载批量音频",
+    "YanhuoAudioBatchMulti": "音频批次合并",
+    "YanhuoAudioBatchSave": "音频批次预览/保存",
+    "YanhuoAudioFilter": "筛选音频",
     "YanhuoGroupIgnoreManager": "组忽略管理器",
 }
