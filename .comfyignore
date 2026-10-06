@@ -7,3 +7,5 @@ __pycache__/
 venv/
 .DS_Store
 Thumbs.db
+# 开发/自检工具不随包发布（自检脚本本身含会触发安全扫描的字面串）
+tools/

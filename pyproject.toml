@@ -1,7 +1,7 @@
 [project]
 name = "yanhuo-easy-use"
 description = "烟火的 ComfyUI 实用节点集：文本处理 / 批量替换、音频拼接与音频批次、图像批次、视频对比、整数控制、组忽略管理等 16 个节点，中文界面，含前端扩展。"
-version = "1.3.0"
+version = "1.3.1"
 license = { file = "LICENSE" }
 dependencies = []
 requires-python = ">=3.9"

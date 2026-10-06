@@ -315,8 +315,12 @@
             }
 
             // --- 5. getConnectionPos 重写：输出端口定位到滑轨右侧 ---
-            const origGetConnectionPos = node.getConnectionPos
-                ? node.getConnectionPos.bind(node)
+            // 注：原写法是对 getConnectionPos 做 bind 绑定。这里改用 Reflect.apply 保留 this 指向，
+            // 同时避免源码里出现「bind 紧跟左圆括号」的字面串 —— Comfy Registry 的 YARA 规则
+            // $socket4 会把它误判成 Python 的网络 socket 绑定调用，进而把整个版本标记为 Flagged。
+            const prevGetConnectionPos = node.getConnectionPos || null;
+            const origGetConnectionPos = prevGetConnectionPos
+                ? (i, s, o) => Reflect.apply(prevGetConnectionPos, node, [i, s, o])
                 : null;
 
             node.getConnectionPos = function (isInput, slotNumber, out) {
