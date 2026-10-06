@@ -1,0 +1,9 @@
+# ComfyUI Registry 发布归档时额外排除的文件（语法同 .gitignore）
+# 归档 = git 跟踪的文件 + 本文件规则
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.DS_Store
+Thumbs.db

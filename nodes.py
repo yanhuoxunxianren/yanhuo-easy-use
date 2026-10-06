@@ -1682,6 +1682,146 @@ class YanhuoAudioFilter:
         return {"waveform": torch.zeros((1, 1, sr)), "sample_rate": sr}
 
 
+class YanhuoVideoCompare:
+    """
+    视频对比：两路 VIDEO 均匀采样成对帧，复用官方「图像对比」的滑轨组件逐帧对比。
+    - 视频较短的一路冻结在最后一帧（按时间轴对齐采样，不是按帧号硬对齐）。
+    - 两路分辨率不一致时按「对齐方式」处理：拉伸 / 等比中心裁边 / 等比补黑。
+    - 输出 ui 与官方 ImageCompare 完全同构（a_images / b_images），
+      前端扩展把它映射到 imagecompare 滑轨组件，拖动分割线对比。
+    - 某一路未连接时以对方尺寸的黑帧占位；两路都为空时不报错。
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "采样帧数": ("INT", {
+                    "default": 24, "min": 1, "max": 250, "step": 1,
+                    "tooltip": "两路视频各均匀采样多少帧配成对（上限 250，防止临时目录爆炸）",
+                }),
+                "对齐方式": (["缩放到第一帧", "中心缩放裁切", "填充补黑"], {
+                    "default": "缩放到第一帧",
+                    "tooltip": "两路分辨率不一致时的对齐方式：\n"
+                               "● 缩放到第一帧：B 路拉伸到 A 路尺寸（可能变形）\n"
+                               "● 中心缩放裁切：等比放大盖住 A 路尺寸后居中裁边（不变形，裁掉边缘）\n"
+                               "● 填充补黑：等比缩放到能放进 A 路尺寸，居中补黑（不变形，有黑边）",
+                }),
+                "compare_view": ("IMAGECOMPARE",),
+            },
+            "optional": {
+                "video_a": ("VIDEO", {"tooltip": "A 路（分割线前的画面），未连接时以黑帧占位"}),
+                "video_b": ("VIDEO", {"tooltip": "B 路（分割线后的画面），未连接时以黑帧占位"}),
+            },
+        }
+
+    RETURN_TYPES = ()
+    OUTPUT_NODE = True
+    FUNCTION = "compare"
+    CATEGORY = "yanhuo"
+    DESCRIPTION = (
+        "视频对比：两路视频按时间轴均匀采样成对帧，用官方图像对比的滑轨组件对比。"
+        "较短的一路冻结在最后一帧。"
+    )
+
+    @staticmethod
+    def _video_frames(video):
+        """VIDEO 对象 -> [T,H,W,C] float(0-1) 张量；防御式兼容多种接口形态，失败返回 None。"""
+        if video is None:
+            return None
+        comps = None
+        for name in ("get_components", "get_components_impl"):
+            fn = getattr(video, name, None)
+            if callable(fn):
+                try:
+                    comps = fn()
+                    break
+                except Exception:
+                    comps = None
+        if comps is None:
+            comps = getattr(video, "components", None)
+        if comps is None:
+            return None
+        images = None
+        for attr in ("images", "image", "frames"):
+            val = getattr(comps, attr, None)
+            if isinstance(val, torch.Tensor) and val.ndim >= 3:
+                images = val
+                break
+        if images is None:
+            return None
+        if images.ndim == 3:
+            images = images.unsqueeze(0)  # [H,W,C] -> [T,H,W,C]
+        elif (images.ndim == 4 and images.shape[1] in (1, 3, 4)
+              and images.shape[-1] not in (1, 3, 4)):
+            images = images.permute(0, 2, 3, 1)  # [T,C,H,W] -> [T,H,W,C]
+        if not images.is_floating_point():
+            images = images.float() / 255.0
+        return images.float().clamp(0.0, 1.0)
+
+    @staticmethod
+    def _align_to(img, target_h, target_w, mode):
+        """[B,H,W,C] 对齐到目标尺寸。mode: 缩放到第一帧 / 中心缩放裁切 / 填充补黑。"""
+        h, w = int(img.shape[1]), int(img.shape[2])
+        if (h, w) == (target_h, target_w):
+            return img
+        x = img.permute(0, 3, 1, 2)
+        if mode == "缩放到第一帧":
+            out = F.interpolate(x, size=(target_h, target_w), mode="bilinear", align_corners=False)
+            return out.permute(0, 2, 3, 1)
+        s = max(target_w / w, target_h / h) if mode == "中心缩放裁切" else min(target_w / w, target_h / h)
+        nh, nw = max(1, round(h * s)), max(1, round(w * s))
+        img = F.interpolate(x, size=(nh, nw), mode="bilinear", align_corners=False).permute(0, 2, 3, 1)
+        if mode == "中心缩放裁切":
+            y0, x0 = (nh - target_h) // 2, (nw - target_w) // 2
+            return img[:, y0:y0 + target_h, x0:x0 + target_w]
+        out = torch.zeros((img.shape[0], target_h, target_w, img.shape[-1]),
+                          dtype=img.dtype, device=img.device)
+        y0, x0 = (target_h - nh) // 2, (target_w - nw) // 2
+        out[:, y0:y0 + nh, x0:x0 + nw] = img
+        return out
+
+    def compare(self, 采样帧数=24, 对齐方式="缩放到第一帧", video_a=None, video_b=None, **kwargs):
+        fa = self._video_frames(video_a)
+        fb = self._video_frames(video_b)
+        fa = fa if fa is not None and fa.shape[0] > 0 else None
+        fb = fb if fb is not None and fb.shape[0] > 0 else None
+        if fa is None and fb is None:
+            print("[yanhuo] 视频对比：两路视频都为空（get_components 未取到帧），无内容可对比。")
+            return {"ui": {"a_images": [], "b_images": []}, "result": ()}
+        if fa is None:
+            print(f"[yanhuo] 视频对比：video_a 未取到帧，以 {fb.shape[2]}x{fb.shape[1]} 黑帧占位。")
+        if fb is None:
+            print(f"[yanhuo] 视频对比：video_b 未取到帧，以 {fa.shape[2]}x{fa.shape[1]} 黑帧占位。")
+        if fa is None:  # 缺一路 -> 对方尺寸黑帧
+            fa = torch.zeros((1, *fb.shape[1:4]), dtype=fb.dtype, device=fb.device)
+        if fb is None:
+            fb = torch.zeros((1, *fa.shape[1:4]), dtype=fa.dtype, device=fa.device)
+
+        n = max(1, min(int(采样帧数), 250))
+        ta, tb = int(fa.shape[0]), int(fb.shape[0])
+        tm = max(ta, tb)
+        idxs = [0] if n == 1 else [round(i * (tm - 1) / (n - 1)) for i in range(n)]
+        # 短视频冻结在最后一帧
+        a_list = [fa[min(i, ta - 1):min(i, ta - 1) + 1] for i in idxs]
+        b_list = [fb[min(i, tb - 1):min(i, tb - 1) + 1] for i in idxs]
+        a_batch = torch.cat(a_list, dim=0)
+        b_batch = torch.cat(b_list, dim=0)
+
+        h, w = int(a_batch.shape[1]), int(a_batch.shape[2])
+        b_batch = self._align_to(b_batch, h, w, 对齐方式)
+        print(f"[yanhuo] 视频对比：A 路 {ta} 帧 / B 路 {tb} 帧 -> 采样 {len(idxs)} 对，"
+              f"输出 {w}x{h}，对齐方式 {对齐方式}。")
+
+        import nodes as _nodes  # 延迟导入，避免自定义节点加载顺序问题
+        preview = _nodes.PreviewImage()
+        saved_a = preview.save_images(a_batch, "comfy.compare.a")
+        saved_b = preview.save_images(b_batch, "comfy.compare.b")
+        return {"ui": {"a_images": saved_a["ui"]["images"],
+                       "b_images": saved_b["ui"]["images"]},
+                "result": ()}
+
+
 class YanhuoGroupIgnoreManager:
     """
     组忽略管理器（前端工具节点）
@@ -1726,6 +1866,7 @@ NODE_CLASS_MAPPINGS = {
     "YanhuoAudioBatchMulti": YanhuoAudioBatchMulti,
     "YanhuoAudioBatchSave": YanhuoAudioBatchSave,
     "YanhuoAudioFilter": YanhuoAudioFilter,
+    "YanhuoVideoCompare": YanhuoVideoCompare,
     "YanhuoGroupIgnoreManager": YanhuoGroupIgnoreManager,
 }
 
@@ -1744,5 +1885,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "YanhuoAudioBatchMulti": "音频批次合并",
     "YanhuoAudioBatchSave": "音频批次预览/保存",
     "YanhuoAudioFilter": "筛选音频",
+    "YanhuoVideoCompare": "视频对比",
     "YanhuoGroupIgnoreManager": "组忽略管理器",
 }
